@@ -222,7 +222,9 @@ function poolNaming(
   if (pool.poolId === "gemini") {
     const families: string[] = [];
     if (catalog) {
-      for (const name of catalog.gemini) addUnique(families, name);
+      const nonFlash = catalog.gemini.filter((name) => !/\bflash\b/i.test(name));
+      const primaryGemini = nonFlash.length > 0 ? nonFlash : catalog.gemini;
+      for (const name of primaryGemini) addUnique(families, name);
       if (!hasSeparateArgon) {
         for (const name of catalog.argon) addUnique(families, name);
       }

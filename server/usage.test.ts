@@ -163,7 +163,7 @@ test("a signed-in Pro account summarizes bottleneck windows per model family wit
   })), [
     {
       id: "gemini",
-      label: "Hydrogen · 3.8 Flash · 5h",
+      label: "Hydrogen · 5h",
       shortLabel: "Hydrogen 5h",
       remainingPct: 88,
       resetsAt: "2030-01-01T04:00:00.000Z",
@@ -274,7 +274,7 @@ test("unknown future quota groups and disabled buckets are handled gracefully wi
   }).fetch(INPUT);
   assert.ok(report.status === "available");
   assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
-    { id: "gemini", label: "Hydrogen · 3.8 Flash · Argon · Weekly", remainingPct: 80 },
+    { id: "gemini", label: "Hydrogen · Argon · Weekly", remainingPct: 80 },
     { id: "exp-weekly", label: "Experimental Model · Weekly", remainingPct: 40 },
   ]);
   assert.ok(report.details?.some((d) => d.label === "Paused Pool" && d.value === "Disabled"));
