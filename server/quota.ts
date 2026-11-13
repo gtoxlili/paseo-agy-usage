@@ -25,12 +25,18 @@ const bucketSchema = z.object({
   resetTime: z.unknown().optional(),
 });
 
+const quotaInfoSchema = z.object({
+  remainingFraction: z.number().optional(),
+  resetTime: z.string().optional(),
+});
+
 const modelEntrySchema = z.object({
   displayName: z.string().optional(),
   apiProvider: z.string().optional(),
   modelProvider: z.string().optional(),
   disabled: z.boolean().optional(),
   isInternal: z.boolean().optional(),
+  quotaInfo: quotaInfoSchema.optional(),
 });
 
 const availableModelsSchema = z.object({
@@ -50,6 +56,8 @@ export interface ModelCatalog {
   gemini: string[];
   argon: string[];
   carbon: string[];
+  argonSharesGemini?: boolean;
+  carbonSharesGemini?: boolean;
 }
 
 interface ParsedBucket {
@@ -103,6 +111,40 @@ function addUnique(list: string[], value: string): void {
   if (value && !list.includes(value)) list.push(value);
 }
 
+interface QuotaSignature {
+  remainingFraction: number | null;
+  resetTimeMs: number | null;
+}
+
+function readQuotaSignature(entry: ModelEntry): QuotaSignature | null {
+  const info = entry.quotaInfo;
+  if (!info) return null;
+  const remainingFraction = typeof info.remainingFraction === "number" && Number.isFinite(info.remainingFraction)
+    ? info.remainingFraction
+    : null;
+  const resetTimeMs = timestampMs(info.resetTime);
+  if (remainingFraction === null && resetTimeMs === null) return null;
+  return { remainingFraction, resetTimeMs };
+}
+
+function quotaSignaturesMatch(a: QuotaSignature, b: QuotaSignature): boolean {
+  if ((a.resetTimeMs === null) !== (b.resetTimeMs === null)) return false;
+  if (a.resetTimeMs !== null && b.resetTimeMs !== null && Math.abs(a.resetTimeMs - b.resetTimeMs) > 5_000) {
+    return false;
+  }
+  if (a.remainingFraction !== null && b.remainingFraction !== null && Math.abs(a.remainingFraction - b.remainingFraction) > 0.01) {
+    return false;
+  }
+  return true;
+}
+
+function familySharesGeminiQuota(geminiRefs: QuotaSignature[], familySignatures: QuotaSignature[]): boolean {
+  // Without per-model quotaInfo on either side, fall back to summary-group membership.
+  if (geminiRefs.length === 0) return true;
+  if (familySignatures.length === 0) return false;
+  return familySignatures.every((sig) => geminiRefs.some((ref) => quotaSignaturesMatch(ref, sig)));
+}
+
 export function extractModelCatalog(document: unknown): ModelCatalog | null {
   const parsed = availableModelsSchema.safeParse(document);
   if (!parsed.success) return null;
@@ -121,26 +163,42 @@ export function extractModelCatalog(document: unknown): ModelCatalog | null {
 
   const primaryIds = sortedIds.length > 0 ? sortedIds : [...entries.keys()];
   const catalog: ModelCatalog = { gemini: [], argon: [], carbon: [] };
+  const primaryGeminiSignatures: QuotaSignature[] = [];
+  const flashGeminiSignatures: QuotaSignature[] = [];
+  const argonSignatures: QuotaSignature[] = [];
+  const carbonSignatures: QuotaSignature[] = [];
 
   for (const id of primaryIds) {
     const entry = entries.get(id);
     if (!entry || entry.isInternal || entry.disabled || !entry.displayName) continue;
     if (!isGoogleModel(id, entry)) continue;
     const name = shortGoogleFamilyName(entry.displayName);
+    const sig = readQuotaSignature(entry);
     if (/\bargon\b/i.test(id) || /\bargon\b/i.test(name)) {
       addUnique(catalog.argon, name);
+      if (sig) argonSignatures.push(sig);
     } else if (/\bcarbon\b/i.test(id) || /\bcarbon\b/i.test(name)) {
       addUnique(catalog.carbon, name);
+      if (sig) carbonSignatures.push(sig);
     } else {
       addUnique(catalog.gemini, name);
+      if (sig) {
+        (/\bflash\b/i.test(name) ? flashGeminiSignatures : primaryGeminiSignatures).push(sig);
+      }
     }
   }
 
+  const geminiRefs = primaryGeminiSignatures.length > 0 ? primaryGeminiSignatures : flashGeminiSignatures;
+  catalog.argonSharesGemini = familySharesGeminiQuota(geminiRefs, argonSignatures);
+  catalog.carbonSharesGemini = familySharesGeminiQuota(geminiRefs, carbonSignatures);
   return catalog;
 }
 
 export function readTierLabel(document: unknown): string | null {
-  const tier = z.object({ id: z.string().min(1) });
+  const tier = z.object({
+    id: z.string().min(1),
+    name: z.string().optional(),
+  });
   const parsed = z.object({
     g1Tier: z.unknown().optional(),
     paidTier: z.unknown().optional(),
@@ -150,16 +208,25 @@ export function readTierLabel(document: unknown): string | null {
   const root = parsed.data;
   // currentTier alone is Code Assist's plan, often free even for a paid
   // Antigravity user. Prefer the consumer Google One fields when present.
-  const id = typeof root.g1Tier === "string" && root.g1Tier !== "" ? root.g1Tier
-    : tier.safeParse(root.paidTier).data?.id ?? tier.safeParse(root.currentTier).data?.id;
+  const g1TierId = typeof root.g1Tier === "string" && root.g1Tier.trim() !== "" ? root.g1Tier.trim() : null;
+  const paid = tier.safeParse(root.paidTier).data;
+  const current = tier.safeParse(root.currentTier).data;
+  const id = g1TierId ?? paid?.id ?? current?.id;
   if (!id) return null;
   const names: Record<string, string> = {
     "free-tier": "Free tier",
     "standard-tier": "Standard tier",
     "g1-pro-tier": "Google AI Pro",
+    "g1-ultra-lite-tier": "Google AI Ultra",
     "g1-ultra-tier": "Google AI Ultra",
   };
-  return Object.hasOwn(names, id) ? names[id] ?? id : id;
+  if (Object.hasOwn(names, id)) return names[id] ?? id;
+  // Use the server's plan name for unknown tiers (ignoring Code Assist's generic
+  // "Antigravity" placeholder on currentTier) before exposing raw tier IDs.
+  const source = id === paid?.id ? paid : id === current?.id ? current : null;
+  const displayName = source?.name?.trim();
+  if (displayName && displayName !== "Antigravity") return displayName;
+  return id;
 }
 
 function classifyPool(bucketId: string, groupName: string | null, groupIndex: number): string {
@@ -225,15 +292,15 @@ function poolNaming(
       const nonFlash = catalog.gemini.filter((name) => !/\bflash\b/i.test(name));
       const primaryGemini = nonFlash.length > 0 ? nonFlash : catalog.gemini;
       for (const name of primaryGemini) addUnique(families, name);
-      if (!hasSeparateArgon) {
+      if (!hasSeparateArgon && catalog.argonSharesGemini !== false) {
         for (const name of catalog.argon) addUnique(families, name);
       }
-      if (!hasSeparateCarbon) {
+      if (!hasSeparateCarbon && catalog.carbonSharesGemini !== false) {
         for (const name of catalog.carbon) addUnique(families, name);
       }
     }
     const baseName = families.length > 0 ? families.join(" · ") : "Gemini";
-    const shortBase = families[0] ?? "Gemini";
+    const shortBase = families.length === 1 ? families[0]! : "Gemini";
     return { windowId: "gemini", baseName, shortBase };
   }
 

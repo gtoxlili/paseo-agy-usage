@@ -233,9 +233,133 @@ test("when Argon has no separate pool (e.g. Ultra) it merges into the Gemini lab
 
   assert.ok(report.status === "available");
   assert.equal(report.planLabel, "Google AI Ultra");
-  assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
-    { id: "gemini", label: "Hydrogen · Argon · 5h", remainingPct: 90 },
-    { id: "gemini-carbon-wtu-weekly", label: "Carbon · Weekly", remainingPct: 75 },
+  assert.deepEqual(report.windows.map(({ id, label, shortLabel, remainingPct }) => ({ id, label, shortLabel, remainingPct })), [
+    { id: "gemini", label: "Hydrogen · Argon · 5h", shortLabel: "Gemini 5h", remainingPct: 90 },
+    { id: "gemini-carbon-wtu-weekly", label: "Carbon · Weekly", shortLabel: "Carbon wk", remainingPct: 75 },
+  ]);
+});
+
+test("g1-ultra-lite-tier maps to Google AI Ultra, unknown paidTier falls back to server name, and shared Hydrogen/Argon/Carbon pool summarizes as Gemini", async () => {
+  // repro: live loadCodeAssist on Google AI Ultra (5x) returns paidTier.id = "g1-ultra-lite-tier"
+  // and retrieveUserQuotaSummary puts Hydrogen, Argon, and Carbon in one shared Gemini Models pool.
+  const sharedQuota = {
+    groups: [
+      {
+        displayName: "Gemini Models",
+        buckets: [
+          { bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.98, resetTime: "2030-01-08T00:00:00Z" },
+          { bucketId: "gemini-5h", window: "5h", remainingFraction: 0.96, resetTime: "2030-01-01T05:00:00Z" },
+        ],
+      },
+      {
+        displayName: "Claude and GPT models",
+        buckets: [
+          { bucketId: "3p-weekly", window: "weekly", remainingFraction: 1, resetTime: "2030-01-08T00:00:00Z" },
+          { bucketId: "3p-5h", window: "5h", remainingFraction: 1, resetTime: "2030-01-01T05:00:00Z" },
+        ],
+      },
+    ],
+  };
+  const sharedModels = {
+    models: {
+      "gemini-4-carbon-high": {
+        displayName: "Gemini 4 Carbon (High)",
+        apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+        quotaInfo: { remainingFraction: 0.96, resetTime: "2030-01-01T05:00:00Z" },
+      },
+      "gemini-4-argon-high": {
+        displayName: "Gemini 4 Argon (High)",
+        apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+        quotaInfo: { remainingFraction: 0.96, resetTime: "2030-01-01T05:00:00Z" },
+      },
+      "gemini-4-hydrogen-high": {
+        displayName: "Gemini 4 Hydrogen (High)",
+        apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+        quotaInfo: { remainingFraction: 0.96, resetTime: "2030-01-01T05:00:00Z" },
+      },
+      "gemini-3.8-flash-high": {
+        displayName: "Gemini 3.8 Flash (High)",
+        apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+        quotaInfo: { remainingFraction: 0.96, resetTime: "2030-01-01T05:00:00Z" },
+      },
+    },
+    agentModelSorts: [
+      {
+        groups: [
+          { modelIds: ["gemini-4-carbon-high", "gemini-4-argon-high", "gemini-4-hydrogen-high", "gemini-3.8-flash-high"] },
+        ],
+      },
+    ],
+  };
+
+  const ultraReport = await usage({
+    fetchApi: async (url) => {
+      if (String(url) === PLAN_URL) {
+        return json({
+          currentTier: { id: "free-tier", name: "Antigravity" },
+          paidTier: { id: "g1-ultra-lite-tier", name: "Google AI Ultra" },
+        });
+      }
+      if (String(url) === MODELS_URL) return json(sharedModels);
+      return json(sharedQuota);
+    },
+  }).fetch(INPUT);
+
+  assert.ok(ultraReport.status === "available");
+  assert.equal(ultraReport.planLabel, "Google AI Ultra");
+  assert.deepEqual(ultraReport.windows.map(({ id, label, shortLabel }) => ({ id, label, shortLabel })), [
+    { id: "gemini", label: "Hydrogen · Argon · Carbon · 5h", shortLabel: "Gemini 5h" },
+    { id: "3p", label: "Claude/GPT · 5h", shortLabel: "Claude/GPT 5h" },
+  ]);
+
+  const futureTierReport = await usage({
+    fetchApi: async (url) => {
+      if (String(url) === PLAN_URL) {
+        return json({
+          currentTier: { id: "free-tier", name: "Antigravity" },
+          paidTier: { id: "g1-plus-tier", name: "Google AI Plus" },
+        });
+      }
+      if (String(url) === MODELS_URL) return json(sharedModels);
+      return json(sharedQuota);
+    },
+  }).fetch(INPUT);
+  assert.ok(futureTierReport.status === "available");
+  assert.equal(futureTierReport.planLabel, "Google AI Plus");
+});
+
+test("Argon and Carbon are not merged into the Gemini pool label when fetchAvailableModels reports divergent quotaInfo", async () => {
+  const divergentModels = {
+    models: {
+      "gemini-4-hydrogen-high": {
+        displayName: "Gemini 4 Hydrogen (High)",
+        apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+        quotaInfo: { remainingFraction: 0.9, resetTime: "2030-01-01T05:00:00Z" },
+      },
+      "gemini-4-argon-high": {
+        displayName: "Gemini 4 Argon (High)",
+        apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+        quotaInfo: { remainingFraction: 0.2, resetTime: "2030-01-07T12:00:00Z" },
+      },
+      "gemini-4-carbon-high": {
+        displayName: "Gemini 4 Carbon (High)",
+        apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+        quotaInfo: { remainingFraction: 0.5, resetTime: "2030-01-06T00:00:00Z" },
+      },
+    },
+    agentModelSorts: [
+      { groups: [{ modelIds: ["gemini-4-hydrogen-high", "gemini-4-argon-high", "gemini-4-carbon-high"] }] },
+    ],
+  };
+
+  const report = await usage({
+    fetchApi: async (url, options) => String(url) === MODELS_URL ? json(divergentModels) : transport(url, options),
+  }).fetch(INPUT);
+
+  assert.ok(report.status === "available");
+  assert.deepEqual(report.windows.map(({ id, label, shortLabel }) => ({ id, label, shortLabel })), [
+    { id: "gemini", label: "Hydrogen · 5h", shortLabel: "Hydrogen 5h" },
+    { id: "3p", label: "Claude/GPT · Weekly", shortLabel: "Claude/GPT wk" },
   ]);
 });
 
