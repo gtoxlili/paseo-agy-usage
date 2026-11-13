@@ -117,7 +117,7 @@ function usage(options: {
   });
 }
 
-test("a signed-in Pro account summarizes bottleneck windows per model family without redundant breakdown clutter", async () => {
+test("a signed-in Pro account shows 5h and weekly windows per model family without redundant breakdown clutter", async () => {
   const withArgon = {
     groups: [
       {
@@ -162,14 +162,28 @@ test("a signed-in Pro account summarizes bottleneck windows per model family wit
     resetsAt,
   })), [
     {
-      id: "gemini",
+      id: "gemini-5h",
       label: "Hydrogen · 5h",
       shortLabel: "Hydrogen 5h",
       remainingPct: 88,
       resetsAt: "2030-01-01T04:00:00.000Z",
     },
     {
-      id: "3p",
+      id: "gemini-weekly",
+      label: "Hydrogen · Weekly",
+      shortLabel: "Hydrogen wk",
+      remainingPct: 96,
+      resetsAt: "2030-01-07T00:00:00.000Z",
+    },
+    {
+      id: "3p-5h",
+      label: "Claude/GPT · 5h",
+      shortLabel: "Claude/GPT 5h",
+      remainingPct: 100,
+      resetsAt: "2030-01-01T05:00:00.000Z",
+    },
+    {
+      id: "3p-weekly",
       label: "Claude/GPT · Weekly",
       shortLabel: "Claude/GPT wk",
       remainingPct: 67,
@@ -234,12 +248,13 @@ test("when Argon has no separate pool (e.g. Ultra) it merges into the Gemini lab
   assert.ok(report.status === "available");
   assert.equal(report.planLabel, "Google AI Ultra");
   assert.deepEqual(report.windows.map(({ id, label, shortLabel, remainingPct }) => ({ id, label, shortLabel, remainingPct })), [
-    { id: "gemini", label: "Hydrogen · Argon · 5h", shortLabel: "Gemini 5h", remainingPct: 90 },
+    { id: "gemini-5h", label: "Hydrogen · Argon · 5h", shortLabel: "Gemini 5h", remainingPct: 90 },
+    { id: "gemini-weekly", label: "Hydrogen · Argon · Weekly", shortLabel: "Gemini wk", remainingPct: 90 },
     { id: "gemini-carbon-wtu-weekly", label: "Carbon · Weekly", shortLabel: "Carbon wk", remainingPct: 75 },
   ]);
 });
 
-test("g1-ultra-lite-tier maps to Google AI Ultra, unknown paidTier falls back to server name, and shared Hydrogen/Argon/Carbon pool summarizes as Gemini", async () => {
+test("g1-ultra-lite-tier maps to Google AI Ultra, unknown paidTier falls back to server name, and shared Hydrogen/Argon/Carbon pool renders 4 windows (5h + Weekly)", async () => {
   // repro: live loadCodeAssist on Google AI Ultra (5x) returns paidTier.id = "g1-ultra-lite-tier"
   // and retrieveUserQuotaSummary puts Hydrogen, Argon, and Carbon in one shared Gemini Models pool.
   const sharedQuota = {
@@ -307,9 +322,11 @@ test("g1-ultra-lite-tier maps to Google AI Ultra, unknown paidTier falls back to
 
   assert.ok(ultraReport.status === "available");
   assert.equal(ultraReport.planLabel, "Google AI Ultra");
-  assert.deepEqual(ultraReport.windows.map(({ id, label, shortLabel }) => ({ id, label, shortLabel })), [
-    { id: "gemini", label: "Hydrogen · Argon · Carbon · 5h", shortLabel: "Gemini 5h" },
-    { id: "3p", label: "Claude/GPT · 5h", shortLabel: "Claude/GPT 5h" },
+  assert.deepEqual(ultraReport.windows.map(({ id, label, shortLabel, remainingPct }) => ({ id, label, shortLabel, remainingPct })), [
+    { id: "gemini-5h", label: "Hydrogen · Argon · Carbon · 5h", shortLabel: "Gemini 5h", remainingPct: 96 },
+    { id: "gemini-weekly", label: "Hydrogen · Argon · Carbon · Weekly", shortLabel: "Gemini wk", remainingPct: 98 },
+    { id: "3p-5h", label: "Claude/GPT · 5h", shortLabel: "Claude/GPT 5h", remainingPct: 100 },
+    { id: "3p-weekly", label: "Claude/GPT · Weekly", shortLabel: "Claude/GPT wk", remainingPct: 100 },
   ]);
 
   const futureTierReport = await usage({
@@ -358,22 +375,26 @@ test("Argon and Carbon are not merged into the Gemini pool label when fetchAvail
 
   assert.ok(report.status === "available");
   assert.deepEqual(report.windows.map(({ id, label, shortLabel }) => ({ id, label, shortLabel })), [
-    { id: "gemini", label: "Hydrogen · 5h", shortLabel: "Hydrogen 5h" },
-    { id: "3p", label: "Claude/GPT · Weekly", shortLabel: "Claude/GPT wk" },
+    { id: "gemini-5h", label: "Hydrogen · 5h", shortLabel: "Hydrogen 5h" },
+    { id: "gemini-weekly", label: "Hydrogen · Weekly", shortLabel: "Hydrogen wk" },
+    { id: "3p-5h", label: "Claude/GPT · 5h", shortLabel: "Claude/GPT 5h" },
+    { id: "3p-weekly", label: "Claude/GPT · Weekly", shortLabel: "Claude/GPT wk" },
   ]);
 });
 
-test("when both 5h and weekly windows are exhausted, the bottleneck takes the later reset time", async () => {
+test("when both 5h and weekly windows are exhausted, both windows are reported with 5h first and distinct reset times", async () => {
   const exhausted = quota([
-    { bucketId: "3p-5h", remainingFraction: 0, resetTime: "2030-01-01T05:00:00Z" },
     { bucketId: "3p-weekly", remainingFraction: 0, resetTime: "2030-01-08T00:00:00Z" },
+    { bucketId: "3p-5h", remainingFraction: 0, resetTime: "2030-01-01T05:00:00Z" },
   ]);
   const report = await usage({
     fetchApi: async (url, options) => String(url) === QUOTA_URL ? json(exhausted) : transport(url, options),
   }).fetch(INPUT);
   assert.ok(report.status === "available");
-  assert.equal(report.windows[0]?.remainingPct, 0);
-  assert.equal(report.windows[0]?.resetsAt, "2030-01-08T00:00:00.000Z");
+  assert.deepEqual(report.windows.map(({ id, remainingPct, resetsAt }) => ({ id, remainingPct, resetsAt })), [
+    { id: "3p-5h", remainingPct: 0, resetsAt: "2030-01-01T05:00:00.000Z" },
+    { id: "3p-weekly", remainingPct: 0, resetsAt: "2030-01-08T00:00:00.000Z" },
+  ]);
 });
 
 test("unknown future quota groups and disabled buckets are handled gracefully without dropping", async () => {
@@ -398,7 +419,7 @@ test("unknown future quota groups and disabled buckets are handled gracefully wi
   }).fetch(INPUT);
   assert.ok(report.status === "available");
   assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
-    { id: "gemini", label: "Hydrogen · Argon · Weekly", remainingPct: 80 },
+    { id: "gemini-weekly", label: "Hydrogen · Argon · Weekly", remainingPct: 80 },
     { id: "exp-weekly", label: "Experimental Model · Weekly", remainingPct: 40 },
   ]);
   assert.ok(report.details?.some((d) => d.label === "Paused Pool" && d.value === "Disabled"));
@@ -428,7 +449,7 @@ test("Windows 在没有 pwsh 和 PowerShell PATH 时仍能读取登录并获取�
   assert.equal(account?.label, "test@example.com");
   const report = await api.fetch(account!.input);
   assert.ok(report.status === "available");
-  assert.equal(report.windows.find(({ id }) => id === "gemini")?.remainingPct, 88);
+  assert.equal(report.windows.find(({ id }) => id === "gemini-5h")?.remainingPct, 88);
 });
 
 test("discovery shows no account without a CLI/login and never assigns the global login to a session", async () => {
@@ -448,7 +469,7 @@ test("free-tier cards explain the plan while omitted quotas remain unknown", asy
   assert.ok(report.status === "available");
   assert.equal(report.planLabel, "Free tier");
   assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
-    { id: "gemini", label: "Gemini · Weekly", remainingPct: 50 },
+    { id: "gemini-weekly", label: "Gemini · Weekly", remainingPct: 50 },
   ]);
   assert.ok(report.details?.some(({ value }) => value.includes("weekly value")));
 });
@@ -482,7 +503,7 @@ test("expired logins are renewed by agy and quota uses the newly stored token", 
     },
   }).fetch(INPUT);
   assert.ok(report.status === "available");
-  assert.equal(report.windows.find(({ id }) => id === "gemini")?.remainingPct, 88);
+  assert.equal(report.windows.find(({ id }) => id === "gemini-5h")?.remainingPct, 88);
 });
 
 test("quota authentication rejection renews the login before retrying with its new token", async () => {
@@ -499,7 +520,7 @@ test("quota authentication rejection renews the login before retrying with its n
           ? json({}, status) : transport(url, options),
     }).fetch(INPUT);
     assert.ok(report.status === "available");
-    assert.equal(report.windows.find(({ id }) => id === "gemini")?.remainingPct, 88);
+    assert.equal(report.windows.find(({ id }) => id === "gemini-5h")?.remainingPct, 88);
   }
 });
 
@@ -522,8 +543,10 @@ test("unavailable plan and models lookups do not hide valid quota", async () => 
   assert.ok(report.status === "available");
   assert.equal(report.planLabel, undefined);
   assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
-    { id: "gemini", label: "Gemini · 5h", remainingPct: 88 },
-    { id: "3p", label: "Claude/GPT · Weekly", remainingPct: 67 },
+    { id: "gemini-5h", label: "Gemini · 5h", remainingPct: 88 },
+    { id: "gemini-weekly", label: "Gemini · Weekly", remainingPct: 96 },
+    { id: "3p-5h", label: "Claude/GPT · 5h", remainingPct: 100 },
+    { id: "3p-weekly", label: "Claude/GPT · Weekly", remainingPct: 67 },
   ]);
 });
 
@@ -555,11 +578,11 @@ test("switching the CLI login updates both the discovered account and fetched qu
   assert.ok(original);
   const before = await api.fetch(original.input);
   assert.ok(before.status === "available");
-  assert.equal(before.windows.find(({ id }) => id === "gemini")?.remainingPct, 88);
+  assert.equal(before.windows.find(({ id }) => id === "gemini-5h")?.remainingPct, 88);
   stored = login("next@example.com", "next-access");
   const [current] = await api.discover({ kind: "global" });
   assert.equal(current?.label, "next@example.com");
   const report = await api.fetch(original.input);
   assert.ok(report.status === "available");
-  assert.equal(report.windows.find(({ id }) => id === "gemini")?.remainingPct, 80);
+  assert.equal(report.windows.find(({ id }) => id === "gemini-weekly")?.remainingPct, 80);
 });

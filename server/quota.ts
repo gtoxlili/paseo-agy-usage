@@ -258,34 +258,12 @@ function shortPeriodSuffix(period: WindowPeriod): string {
   return "";
 }
 
-function selectBottleneck(valid: ParsedBucket[]): { chosen: ParsedBucket; resetsAtMs: number | null } {
-  const first = valid[0]!;
-  if (valid.length === 1) {
-    return { chosen: first, resetsAtMs: first.resetsAtMs };
-  }
-
-  const maxUsed = Math.max(...valid.map((entry) => entry.usedPct ?? -1));
-  const tied = valid.filter((entry) => entry.usedPct === maxUsed);
-  const allExhausted = maxUsed >= 100 && valid.every((entry) => (entry.usedPct ?? 0) >= 100);
-
-  if (allExhausted) {
-    // When every window in the pool is exhausted, service resumes only after the latest reset.
-    const sortedByLatestReset = [...tied].sort((a, b) => (b.resetsAtMs ?? -1) - (a.resetsAtMs ?? -1));
-    const chosen = sortedByLatestReset[0]!;
-    return { chosen, resetsAtMs: chosen.resetsAtMs };
-  }
-
-  const sorted = [...tied].sort((a, b) => PERIOD_PRIORITY[a.period] - PERIOD_PRIORITY[b.period]);
-  const chosen = sorted[0]!;
-  return { chosen, resetsAtMs: chosen.resetsAtMs };
-}
-
 function poolNaming(
   pool: PoolAccumulator,
   hasSeparateArgon: boolean,
   hasSeparateCarbon: boolean,
   catalog: ModelCatalog | null,
-): { windowId: string; baseName: string; shortBase: string } {
+): { baseName: string; shortBase: string } {
   if (pool.poolId === "gemini") {
     const families: string[] = [];
     if (catalog) {
@@ -301,32 +279,28 @@ function poolNaming(
     }
     const baseName = families.length > 0 ? families.join(" · ") : "Gemini";
     const shortBase = families.length === 1 ? families[0]! : "Gemini";
-    return { windowId: "gemini", baseName, shortBase };
+    return { baseName, shortBase };
   }
 
   if (pool.poolId === "3p") {
-    return { windowId: "3p", baseName: "Claude/GPT", shortBase: "Claude/GPT" };
+    return { baseName: "Claude/GPT", shortBase: "Claude/GPT" };
   }
 
   if (pool.poolId === "argon") {
-    const existingId = pool.active.find((entry) => entry.bucket.bucketId === "gemini-argon-wtu-weekly")
-      ?.bucket.bucketId;
     const families = catalog?.argon ?? [];
     const baseName = families.length > 0 ? families.join(" · ") : "Argon";
-    return { windowId: existingId ?? "argon", baseName, shortBase: "Argon" };
+    return { baseName, shortBase: "Argon" };
   }
 
   if (pool.poolId === "carbon") {
-    const firstId = pool.active[0]?.bucket.bucketId ?? pool.disabled[0]?.bucket.bucketId ?? "carbon";
     const families = catalog?.carbon ?? [];
     const baseName = families.length > 0 ? families.join(" · ") : "Carbon";
-    return { windowId: firstId, baseName, shortBase: "Carbon" };
+    return { baseName, shortBase: "Carbon" };
   }
 
   const first = pool.active[0] ?? pool.disabled[0];
   const baseName = pool.groupName || first?.bucket.displayName?.trim() || first?.bucket.bucketId || "Quota";
-  const windowId = pool.active.length === 1 && first ? first.bucket.bucketId : pool.poolId;
-  return { windowId, baseName, shortBase: baseName.slice(0, 14) };
+  return { baseName, shortBase: baseName.slice(0, 14) };
 }
 
 export function mapQuotaSummary(
@@ -398,43 +372,30 @@ export function mapQuotaSummary(
   const details: UsageDetail[] = [];
 
   for (const pool of orderedPools) {
-    const { windowId, baseName, shortBase } = poolNaming(pool, hasSeparateArgon, hasSeparateCarbon, modelCatalog);
+    const { baseName, shortBase } = poolNaming(pool, hasSeparateArgon, hasSeparateCarbon, modelCatalog);
 
     if (pool.active.length === 0) {
       details.push({ id: `disabled-${pool.poolId}`, label: baseName, value: "Disabled" });
       continue;
     }
 
-    const valid = pool.active.filter((entry) => entry.usedPct !== null);
-    if (valid.length === 0) {
-      const onlyPeriod = pool.active.length === 1 ? periodLabel(pool.active[0]!.period) : null;
+    const orderedBuckets = [...pool.active].sort((a, b) => PERIOD_PRIORITY[a.period] - PERIOD_PRIORITY[b.period]);
+    for (const entry of orderedBuckets) {
+      const pLabel = periodLabel(entry.period, entry.bucket.displayName);
+      const label = `${baseName} · ${pLabel}`;
+      const shortSuffix = shortPeriodSuffix(entry.period);
+      const shortLabel = shortSuffix ? `${shortBase} ${shortSuffix}` : shortBase;
+
       windows.push(windowFromUsedPct({
-        id: windowId,
-        label: onlyPeriod ? `${baseName} · ${onlyPeriod}` : baseName,
-        shortLabel: shortBase,
+        id: entry.bucket.bucketId,
+        label,
+        shortLabel,
         summary: true,
-        utilizationPct: null,
-        resetsAt: null,
-        tone: toneFromUsedPct(null),
+        utilizationPct: entry.usedPct,
+        resetsAt: entry.resetsAtMs === null ? null : new Date(entry.resetsAtMs).toISOString(),
+        tone: toneFromUsedPct(entry.usedPct),
       }));
-      continue;
     }
-
-    const { chosen, resetsAtMs } = selectBottleneck(valid);
-    const pLabel = periodLabel(chosen.period, chosen.bucket.displayName);
-    const label = `${baseName} · ${pLabel}`;
-    const shortSuffix = shortPeriodSuffix(chosen.period);
-    const shortLabel = shortSuffix ? `${shortBase} ${shortSuffix}` : shortBase;
-
-    windows.push(windowFromUsedPct({
-      id: windowId,
-      label,
-      shortLabel,
-      summary: true,
-      utilizationPct: chosen.usedPct,
-      resetsAt: resetsAtMs === null ? null : new Date(resetsAtMs).toISOString(),
-      tone: toneFromUsedPct(chosen.usedPct),
-    }));
   }
 
   if (windows.length > 0 && windows.every((window) => window.usedPct === null)) {
