@@ -31,9 +31,6 @@ const modelEntrySchema = z.object({
   modelProvider: z.string().optional(),
   disabled: z.boolean().optional(),
   isInternal: z.boolean().optional(),
-  recommended: z.boolean().optional(),
-  tagTitle: z.string().optional(),
-  tagDescription: z.string().optional(),
 });
 
 const availableModelsSchema = z.object({
@@ -49,18 +46,10 @@ type Bucket = z.infer<typeof bucketSchema>;
 type ModelEntry = z.infer<typeof modelEntrySchema>;
 type WindowPeriod = "5h" | "weekly" | "other";
 
-export interface DisabledModelNote {
-  id: string;
-  name: string;
-  reason: string;
-}
-
 export interface ModelCatalog {
   gemini: string[];
-  threeParty: string[];
   argon: string[];
   carbon: string[];
-  disabled: DisabledModelNote[];
 }
 
 interface ParsedBucket {
@@ -91,7 +80,7 @@ const PERIOD_PRIORITY: Record<WindowPeriod, number> = {
   other: 2,
 };
 
-function shortFamilyName(displayName: string): string {
+function shortGoogleFamilyName(displayName: string): string {
   const withoutEffort = displayName.replace(/\s*\((?:Low|Medium|High|XHigh|Max)\)\s*$/i, "").trim();
   if (/^Gemini\s+4\s+/i.test(withoutEffort)) {
     return withoutEffort.replace(/^Gemini\s+4\s+/i, "").trim();
@@ -99,26 +88,7 @@ function shortFamilyName(displayName: string): string {
   if (/^Gemini\s+\d/i.test(withoutEffort)) {
     return withoutEffort.replace(/^Gemini\s+/i, "").trim();
   }
-  if (/^Claude\s+/i.test(withoutEffort)) {
-    return withoutEffort.replace(/^Claude\s+/i, "").trim();
-  }
-  if (/^GPT-OSS\b/i.test(withoutEffort)) {
-    return "GPT-OSS";
-  }
   return withoutEffort;
-}
-
-function isThreePartyModel(id: string, entry: ModelEntry): boolean {
-  const api = entry.apiProvider ?? "";
-  const provider = entry.modelProvider ?? "";
-  return (
-    api === "API_PROVIDER_ANTHROPIC_VERTEX" ||
-    api === "API_PROVIDER_OPENAI_VERTEX" ||
-    provider === "MODEL_PROVIDER_ANTHROPIC" ||
-    provider === "MODEL_PROVIDER_OPENAI" ||
-    id.startsWith("claude-") ||
-    id.startsWith("gpt-")
-  );
 }
 
 function isGoogleModel(id: string, entry: ModelEntry): boolean {
@@ -150,42 +120,20 @@ export function extractModelCatalog(document: unknown): ModelCatalog | null {
     .filter((id) => entries.has(id));
 
   const primaryIds = sortedIds.length > 0 ? sortedIds : [...entries.keys()];
-  const catalog: ModelCatalog = { gemini: [], threeParty: [], argon: [], carbon: [], disabled: [] };
-  const seenDisabled = new Set<string>();
-
-  const recordDisabled = (id: string, entry: ModelEntry) => {
-    if (entry.isInternal || !entry.displayName) return;
-    const name = shortFamilyName(entry.displayName);
-    if (!name || seenDisabled.has(name)) return;
-    seenDisabled.add(name);
-    const reason = entry.tagDescription?.trim() || entry.tagTitle?.trim() || "Unavailable";
-    catalog.disabled.push({ id, name, reason });
-  };
+  const catalog: ModelCatalog = { gemini: [], argon: [], carbon: [] };
 
   for (const id of primaryIds) {
     const entry = entries.get(id);
-    if (!entry || entry.isInternal || !entry.displayName) continue;
-    if (entry.disabled) {
-      recordDisabled(id, entry);
-      continue;
+    if (!entry || entry.isInternal || entry.disabled || !entry.displayName) continue;
+    if (!isGoogleModel(id, entry)) continue;
+    const name = shortGoogleFamilyName(entry.displayName);
+    if (/\bargon\b/i.test(id) || /\bargon\b/i.test(name)) {
+      addUnique(catalog.argon, name);
+    } else if (/\bcarbon\b/i.test(id) || /\bcarbon\b/i.test(name)) {
+      addUnique(catalog.carbon, name);
+    } else {
+      addUnique(catalog.gemini, name);
     }
-    const name = shortFamilyName(entry.displayName);
-    if (isThreePartyModel(id, entry)) {
-      addUnique(catalog.threeParty, name);
-    } else if (isGoogleModel(id, entry)) {
-      if (/\bargon\b/i.test(id) || /\bargon\b/i.test(name)) {
-        addUnique(catalog.argon, name);
-      } else if (/\bcarbon\b/i.test(id) || /\bcarbon\b/i.test(name)) {
-        addUnique(catalog.carbon, name);
-      } else {
-        addUnique(catalog.gemini, name);
-      }
-    }
-  }
-
-  // Catch disabled models (e.g., Carbon) even if absent from agentModelSorts.
-  for (const [id, entry] of entries) {
-    if (entry.disabled) recordDisabled(id, entry);
   }
 
   return catalog;
@@ -288,10 +236,7 @@ function poolNaming(
   }
 
   if (pool.poolId === "3p") {
-    const families = catalog?.threeParty ?? [];
-    const baseName = families.length > 0 ? families.join(" · ") : "Claude & GPT";
-    const shortBase = families[0] ?? "3P";
-    return { windowId: "3p", baseName, shortBase };
+    return { windowId: "3p", baseName: "Claude/GPT", shortBase: "Claude/GPT" };
   }
 
   if (pool.poolId === "argon") {
@@ -407,11 +352,8 @@ export function mapQuotaSummary(
     }
 
     const { chosen, resetsAtMs } = selectBottleneck(valid);
-    const hasMultipleWindows = valid.length > 1;
     const pLabel = periodLabel(chosen.period, chosen.bucket.displayName);
-    const label = hasMultipleWindows
-      ? `${baseName} · ${pLabel} cap`
-      : `${baseName} · ${pLabel}`;
+    const label = `${baseName} · ${pLabel}`;
     const shortSuffix = shortPeriodSuffix(chosen.period);
     const shortLabel = shortSuffix ? `${shortBase} ${shortSuffix}` : shortBase;
 
@@ -424,38 +366,10 @@ export function mapQuotaSummary(
       resetsAt: resetsAtMs === null ? null : new Date(resetsAtMs).toISOString(),
       tone: toneFromUsedPct(chosen.usedPct),
     }));
-
-    if (hasMultipleWindows) {
-      const sortedWindows = [...valid].sort((a, b) => PERIOD_PRIORITY[a.period] - PERIOD_PRIORITY[b.period]);
-      const summaryLine = sortedWindows
-        .map((entry) => `${periodLabel(entry.period, entry.bucket.displayName)} ${Math.round(entry.usedPct!)}% used`)
-        .join(" · ");
-      details.push({
-        id: `breakdown-${pool.poolId}`,
-        label: baseName,
-        value: summaryLine,
-      });
-    }
   }
 
   if (windows.length > 0 && windows.every((window) => window.usedPct === null)) {
     throw new UsageError("Antigravity quota buckets contain no valid remainingFraction readings.");
-  }
-
-  if (modelCatalog) {
-    for (const disabled of modelCatalog.disabled) {
-      // Avoid duplicating if the quota summary already emitted a disabled detail for this pool.
-      const coveredByPool =
-        (disabled.id.includes("carbon") && pools.get("carbon")?.active.length === 0) ||
-        (disabled.id.includes("argon") && pools.get("argon")?.active.length === 0);
-      if (!coveredByPool) {
-        details.push({
-          id: `disabled-model-${disabled.id}`,
-          label: disabled.name,
-          value: disabled.reason,
-        });
-      }
-    }
   }
 
   if (planLabel === "Free tier") {

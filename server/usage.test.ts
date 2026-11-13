@@ -117,7 +117,7 @@ function usage(options: {
   });
 }
 
-test("a signed-in Pro account summarizes bottleneck windows per model family and keeps 5h/weekly breakdown in details", async () => {
+test("a signed-in Pro account summarizes bottleneck windows per model family without redundant breakdown clutter", async () => {
   const withArgon = {
     groups: [
       {
@@ -163,15 +163,15 @@ test("a signed-in Pro account summarizes bottleneck windows per model family and
   })), [
     {
       id: "gemini",
-      label: "Hydrogen · 3.8 Flash · 5h cap",
+      label: "Hydrogen · 3.8 Flash · 5h",
       shortLabel: "Hydrogen 5h",
       remainingPct: 88,
       resetsAt: "2030-01-01T04:00:00.000Z",
     },
     {
       id: "3p",
-      label: "Opus 5.5 · Sonnet 5.5 · GPT-OSS · Weekly cap",
-      shortLabel: "Opus 5.5 wk",
+      label: "Claude/GPT · Weekly",
+      shortLabel: "Claude/GPT wk",
       remainingPct: 67,
       resetsAt: "2030-01-08T00:00:00.000Z",
     },
@@ -183,15 +183,7 @@ test("a signed-in Pro account summarizes bottleneck windows per model family and
       resetsAt: "2030-01-07T12:00:00.000Z",
     },
   ]);
-  assert.deepEqual(report.details, [
-    { id: "breakdown-gemini", label: "Hydrogen · 3.8 Flash", value: "5h 12% used · Weekly 4% used" },
-    { id: "breakdown-3p", label: "Opus 5.5 · Sonnet 5.5 · GPT-OSS", value: "5h 0% used · Weekly 33% used" },
-    {
-      id: "disabled-model-gemini-4-carbon-disabled",
-      label: "Carbon",
-      value: "Gemini 4 Carbon is currently available to Ultra plan subscribers.",
-    },
-  ]);
+  assert.deepEqual(report.details, []);
 });
 
 test("when Argon has no separate pool (e.g. Ultra) it merges into the Gemini label and an active Carbon pool is shown", async () => {
@@ -242,7 +234,7 @@ test("when Argon has no separate pool (e.g. Ultra) it merges into the Gemini lab
   assert.ok(report.status === "available");
   assert.equal(report.planLabel, "Google AI Ultra");
   assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
-    { id: "gemini", label: "Hydrogen · Argon · 5h cap", remainingPct: 90 },
+    { id: "gemini", label: "Hydrogen · Argon · 5h", remainingPct: 90 },
     { id: "gemini-carbon-wtu-weekly", label: "Carbon · Weekly", remainingPct: 75 },
   ]);
 });
@@ -406,8 +398,8 @@ test("unavailable plan and models lookups do not hide valid quota", async () => 
   assert.ok(report.status === "available");
   assert.equal(report.planLabel, undefined);
   assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
-    { id: "gemini", label: "Gemini · 5h cap", remainingPct: 88 },
-    { id: "3p", label: "Claude & GPT · Weekly cap", remainingPct: 67 },
+    { id: "gemini", label: "Gemini · 5h", remainingPct: 88 },
+    { id: "3p", label: "Claude/GPT · Weekly", remainingPct: 67 },
   ]);
 });
 
