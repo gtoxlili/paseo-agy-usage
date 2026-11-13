@@ -8,14 +8,73 @@ const BINARY = "C:\\Users\\test\\AppData\\Local\\agy\\bin\\agy.exe";
 const INPUT = { store: "windows-credential-manager" } as const;
 const QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 const PLAN_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+const MODELS_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 const quota = (buckets: unknown[]) => ({ groups: [{ buckets }] });
+
 const QUOTA = quota([
-  { bucketId: "3p-weekly", remainingFraction: 0 },
-  { bucketId: "3p-5h", remainingFraction: 0.1 },
-  { bucketId: "gemini-weekly", remainingFraction: 0.25, resetTime: "2030-01-08T00:00:00Z" },
-  { bucketId: "gemini-5h", remainingFraction: 1 },
+  { bucketId: "3p-weekly", remainingFraction: 0.67, resetTime: "2030-01-08T00:00:00Z" },
+  { bucketId: "3p-5h", remainingFraction: 1, resetTime: "2030-01-01T05:00:00Z" },
+  { bucketId: "gemini-weekly", remainingFraction: 0.96, resetTime: "2030-01-07T00:00:00Z" },
+  { bucketId: "gemini-5h", remainingFraction: 0.88, resetTime: "2030-01-01T04:00:00Z" },
 ]);
+
+const MODELS = {
+  models: {
+    "gemini-4-argon-medium": {
+      displayName: "Gemini 4 Argon (Medium)",
+      apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+    },
+    "gemini-4-hydrogen-high": {
+      displayName: "Gemini 4 Hydrogen (High)",
+      apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+    },
+    "gemini-3.8-flash-high": {
+      displayName: "Gemini 3.8 Flash (High)",
+      apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+    },
+    "claude-opus-5-5-high": {
+      displayName: "Claude Opus 5.5 (High)",
+      apiProvider: "API_PROVIDER_ANTHROPIC_VERTEX",
+    },
+    "claude-sonnet-5-5-high": {
+      displayName: "Claude Sonnet 5.5 (High)",
+      apiProvider: "API_PROVIDER_ANTHROPIC_VERTEX",
+    },
+    "gpt-oss-120b-medium": {
+      displayName: "GPT-OSS 120B (Medium)",
+      apiProvider: "API_PROVIDER_OPENAI_VERTEX",
+    },
+    "gemini-4-carbon-disabled": {
+      displayName: "Gemini 4 Carbon",
+      apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+      disabled: true,
+      tagTitle: "Unavailable",
+      tagDescription: "Gemini 4 Carbon is currently available to Ultra plan subscribers.",
+    },
+    chat_20706: {
+      isInternal: true,
+      apiProvider: "API_PROVIDER_INTERNAL",
+    },
+  },
+  agentModelSorts: [
+    {
+      groups: [
+        {
+          modelIds: [
+            "gemini-4-argon-medium",
+            "gemini-4-hydrogen-high",
+            "gemini-3.8-flash-high",
+            "claude-opus-5-5-high",
+            "claude-sonnet-5-5-high",
+            "gpt-oss-120b-medium",
+            "gemini-4-carbon-disabled",
+          ],
+        },
+      ],
+    },
+  ],
+};
 
 function login(email = "test@example.com", accessToken = "test-access", expiry = NOW + 3_600_000) {
   const claims = Buffer.from(JSON.stringify({ email })).toString("base64url");
@@ -30,6 +89,7 @@ const transport: typeof fetch = async (url, options) => {
   if (new Headers(options?.headers).get("user-agent") !== "antigravity/cli/1.4.2") return json(quota([]));
   if (String(url) === QUOTA_URL) return json(QUOTA);
   if (String(url) === PLAN_URL) return json({ paidTier: { id: "g1-pro-tier" }, currentTier: { id: "free-tier" } });
+  if (String(url) === MODELS_URL) return json(MODELS);
   throw new Error("Unexpected service endpoint");
 };
 
@@ -57,8 +117,35 @@ function usage(options: {
   });
 }
 
-test("a signed-in account produces the email footer, plan badge and four quota windows", async () => {
-  const api = usage();
+test("a signed-in Pro account summarizes bottleneck windows per model family and keeps 5h/weekly breakdown in details", async () => {
+  const withArgon = {
+    groups: [
+      {
+        displayName: "Gemini Models",
+        buckets: [
+          { bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.96, resetTime: "2030-01-07T00:00:00Z" },
+          { bucketId: "gemini-5h", window: "5h", remainingFraction: 0.88, resetTime: "2030-01-01T04:00:00Z" },
+        ],
+      },
+      {
+        displayName: "Claude and GPT models",
+        buckets: [
+          { bucketId: "3p-weekly", window: "weekly", remainingFraction: 0.67, resetTime: "2030-01-08T00:00:00Z" },
+          { bucketId: "3p-5h", window: "5h", remainingFraction: 1, resetTime: "2030-01-01T05:00:00Z" },
+        ],
+      },
+      {
+        displayName: "Gemini 4 Argon",
+        buckets: [
+          { bucketId: "gemini-argon-wtu-weekly", window: "weekly", remainingFraction: 0.15, resetTime: "2030-01-07T12:00:00Z" },
+        ],
+      },
+    ],
+  };
+
+  const api = usage({
+    fetchApi: async (url, options) => String(url) === QUOTA_URL ? json(withArgon) : transport(url, options),
+  });
   const [account] = await api.discover({ kind: "global" });
   assert.ok(account);
   assert.equal(account.label, "test@example.com");
@@ -67,27 +154,138 @@ test("a signed-in account produces the email footer, plan badge and four quota w
   const report = await api.fetch(account.input);
   assert.ok(report.status === "available");
   assert.equal(report.planLabel, "Google AI Pro");
-  assert.deepEqual(report.windows.map(({ id, remainingPct }) => [id, remainingPct]), [
-    ["gemini-5h", 100], ["gemini-weekly", 25], ["3p-5h", 10], ["3p-weekly", 0],
+  assert.deepEqual(report.windows.map(({ id, label, shortLabel, remainingPct, resetsAt }) => ({
+    id,
+    label,
+    shortLabel,
+    remainingPct,
+    resetsAt,
+  })), [
+    {
+      id: "gemini",
+      label: "Hydrogen · 3.8 Flash · 5h cap",
+      shortLabel: "Hydrogen 5h",
+      remainingPct: 88,
+      resetsAt: "2030-01-01T04:00:00.000Z",
+    },
+    {
+      id: "3p",
+      label: "Opus 5.5 · Sonnet 5.5 · GPT-OSS · Weekly cap",
+      shortLabel: "Opus 5.5 wk",
+      remainingPct: 67,
+      resetsAt: "2030-01-08T00:00:00.000Z",
+    },
+    {
+      id: "gemini-argon-wtu-weekly",
+      label: "Argon · Weekly",
+      shortLabel: "Argon wk",
+      remainingPct: 15,
+      resetsAt: "2030-01-07T12:00:00.000Z",
+    },
   ]);
-  assert.equal(report.windows.find(({ id }) => id === "gemini-weekly")?.resetsAt, "2030-01-08T00:00:00.000Z");
-  assert.deepEqual(report.details, []); // No duplicate Plan or Account rows.
+  assert.deepEqual(report.details, [
+    { id: "breakdown-gemini", label: "Hydrogen · 3.8 Flash", value: "5h 12% used · Weekly 4% used" },
+    { id: "breakdown-3p", label: "Opus 5.5 · Sonnet 5.5 · GPT-OSS", value: "5h 0% used · Weekly 33% used" },
+    {
+      id: "disabled-model-gemini-4-carbon-disabled",
+      label: "Carbon",
+      value: "Gemini 4 Carbon is currently available to Ultra plan subscribers.",
+    },
+  ]);
 });
 
-test("a separately metered Gemini 4 Argon pool adds its weekly window", async () => {
-  const withArgon = quota([
-    ...QUOTA.groups.flatMap(({ buckets }) => buckets),
-    { bucketId: "gemini-argon-wtu-weekly", remainingFraction: 0.75, resetTime: "2030-01-08T00:00:00Z" },
-  ]);
-  const report = await usage({ fetchApi: async (url) => json(String(url) === PLAN_URL
-    ? { paidTier: { id: "g1-pro-tier" } }
-    : withArgon) }).fetch(INPUT);
+test("when Argon has no separate pool (e.g. Ultra) it merges into the Gemini label and an active Carbon pool is shown", async () => {
+  const ultraQuota = {
+    groups: [
+      {
+        displayName: "Gemini Models",
+        buckets: [
+          { bucketId: "gemini-weekly", window: "weekly", remainingFraction: 0.9, resetTime: "2030-01-08T00:00:00Z" },
+          { bucketId: "gemini-5h", window: "5h", remainingFraction: 0.9, resetTime: "2030-01-01T05:00:00Z" },
+        ],
+      },
+      {
+        displayName: "Gemini 4 Carbon",
+        buckets: [
+          { bucketId: "gemini-carbon-wtu-weekly", window: "weekly", remainingFraction: 0.75, resetTime: "2030-01-08T06:00:00Z" },
+        ],
+      },
+    ],
+  };
+  const ultraModels = {
+    ...MODELS,
+    models: {
+      ...MODELS.models,
+      "gemini-4-carbon-disabled": undefined,
+      "gemini-4-carbon-high": {
+        displayName: "Gemini 4 Carbon (High)",
+        apiProvider: "API_PROVIDER_GOOGLE_GEMINI",
+      },
+    },
+    agentModelSorts: [
+      {
+        groups: [
+          { modelIds: ["gemini-4-hydrogen-high", "gemini-4-argon-medium", "gemini-4-carbon-high"] },
+        ],
+      },
+    ],
+  };
+
+  const report = await usage({
+    fetchApi: async (url) => {
+      if (String(url) === PLAN_URL) return json({ paidTier: { id: "g1-ultra-tier" } });
+      if (String(url) === MODELS_URL) return json(ultraModels);
+      return json(ultraQuota);
+    },
+  }).fetch(INPUT);
+
   assert.ok(report.status === "available");
-  assert.deepEqual(report.windows.map(({ id, remainingPct }) => [id, remainingPct]), [
-    ["gemini-5h", 100], ["gemini-weekly", 25], ["3p-5h", 10], ["3p-weekly", 0], ["gemini-argon-wtu-weekly", 75],
+  assert.equal(report.planLabel, "Google AI Ultra");
+  assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
+    { id: "gemini", label: "Hydrogen · Argon · 5h cap", remainingPct: 90 },
+    { id: "gemini-carbon-wtu-weekly", label: "Carbon · Weekly", remainingPct: 75 },
   ]);
-  assert.equal(report.windows.at(-1)?.label, "Gemini 4 Argon · Weekly");
-  assert.deepEqual(report.details, []);
+});
+
+test("when both 5h and weekly windows are exhausted, the bottleneck takes the later reset time", async () => {
+  const exhausted = quota([
+    { bucketId: "3p-5h", remainingFraction: 0, resetTime: "2030-01-01T05:00:00Z" },
+    { bucketId: "3p-weekly", remainingFraction: 0, resetTime: "2030-01-08T00:00:00Z" },
+  ]);
+  const report = await usage({
+    fetchApi: async (url, options) => String(url) === QUOTA_URL ? json(exhausted) : transport(url, options),
+  }).fetch(INPUT);
+  assert.ok(report.status === "available");
+  assert.equal(report.windows[0]?.remainingPct, 0);
+  assert.equal(report.windows[0]?.resetsAt, "2030-01-08T00:00:00.000Z");
+});
+
+test("unknown future quota groups and disabled buckets are handled gracefully without dropping", async () => {
+  const customQuota = {
+    groups: [
+      {
+        displayName: "Gemini Models",
+        buckets: [{ bucketId: "gemini-weekly", remainingFraction: 0.8 }],
+      },
+      {
+        displayName: "Experimental Model",
+        buckets: [{ bucketId: "exp-weekly", remainingFraction: 0.4, resetTime: "2030-01-05T00:00:00Z" }],
+      },
+      {
+        displayName: "Paused Pool",
+        buckets: [{ bucketId: "paused-weekly", disabled: true }],
+      },
+    ],
+  };
+  const report = await usage({
+    fetchApi: async (url, options) => String(url) === QUOTA_URL ? json(customQuota) : transport(url, options),
+  }).fetch(INPUT);
+  assert.ok(report.status === "available");
+  assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
+    { id: "gemini", label: "Hydrogen · 3.8 Flash · Argon · Weekly", remainingPct: 80 },
+    { id: "exp-weekly", label: "Experimental Model · Weekly", remainingPct: 40 },
+  ]);
+  assert.ok(report.details?.some((d) => d.label === "Paused Pool" && d.value === "Disabled"));
 });
 
 test("Windows 在没有 pwsh 和 PowerShell PATH 时仍能读取登录并获取额度", async () => {
@@ -114,7 +312,7 @@ test("Windows 在没有 pwsh 和 PowerShell PATH 时仍能读取登录并获取�
   assert.equal(account?.label, "test@example.com");
   const report = await api.fetch(account!.input);
   assert.ok(report.status === "available");
-  assert.equal(report.windows.find(({ id }) => id === "gemini-weekly")?.remainingPct, 25);
+  assert.equal(report.windows.find(({ id }) => id === "gemini")?.remainingPct, 88);
 });
 
 test("discovery shows no account without a CLI/login and never assigns the global login to a session", async () => {
@@ -124,13 +322,19 @@ test("discovery shows no account without a CLI/login and never assigns the globa
 });
 
 test("free-tier cards explain the plan while omitted quotas remain unknown", async () => {
-  const report = await usage({ fetchApi: async (url) => json(String(url) === PLAN_URL
-    ? { currentTier: { id: "free-tier" } }
-    : quota([{ bucketId: "gemini-weekly", remainingFraction: 0.5 }])) }).fetch(INPUT);
+  const report = await usage({
+    fetchApi: async (url) => {
+      if (String(url) === PLAN_URL) return json({ currentTier: { id: "free-tier" } });
+      if (String(url) === MODELS_URL) return json({}, 403);
+      return json(quota([{ bucketId: "gemini-weekly", remainingFraction: 0.5 }]));
+    },
+  }).fetch(INPUT);
   assert.ok(report.status === "available");
   assert.equal(report.planLabel, "Free tier");
-  assert.deepEqual(report.windows.map(({ remainingPct }) => remainingPct), [null, 50, null, null]);
-  assert.ok(report.details?.some(({ value }) => value.includes("weekly buckets")));
+  assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
+    { id: "gemini", label: "Gemini · Weekly", remainingPct: 50 },
+  ]);
+  assert.ok(report.details?.some(({ value }) => value.includes("weekly value")));
 });
 
 test("expired, rejected and quota-less logins produce native unavailable diagnostics", async () => {
@@ -162,7 +366,7 @@ test("expired logins are renewed by agy and quota uses the newly stored token", 
     },
   }).fetch(INPUT);
   assert.ok(report.status === "available");
-  assert.equal(report.windows.find(({ id }) => id === "gemini-weekly")?.remainingPct, 25);
+  assert.equal(report.windows.find(({ id }) => id === "gemini")?.remainingPct, 88);
 });
 
 test("quota authentication rejection renews the login before retrying with its new token", async () => {
@@ -179,7 +383,7 @@ test("quota authentication rejection renews the login before retrying with its n
           ? json({}, status) : transport(url, options),
     }).fetch(INPUT);
     assert.ok(report.status === "available");
-    assert.equal(report.windows.find(({ id }) => id === "gemini-weekly")?.remainingPct, 25);
+    assert.equal(report.windows.find(({ id }) => id === "gemini")?.remainingPct, 88);
   }
 });
 
@@ -192,11 +396,19 @@ test("failed CLI renewal reports an error without leaking command output", async
   assert.ok(!report.error.includes("private-payload"));
 });
 
-test("an unavailable plan label does not hide valid quota", async () => {
-  const report = await usage({ fetchApi: async (url) => String(url) === PLAN_URL ? json({}, 403) : json(QUOTA) }).fetch(INPUT);
+test("unavailable plan and models lookups do not hide valid quota", async () => {
+  const report = await usage({
+    fetchApi: async (url) => {
+      if (String(url) === PLAN_URL || String(url) === MODELS_URL) return json({}, 403);
+      return json(QUOTA);
+    },
+  }).fetch(INPUT);
   assert.ok(report.status === "available");
   assert.equal(report.planLabel, undefined);
-  assert.equal(report.windows.find(({ id }) => id === "gemini-weekly")?.remainingPct, 25);
+  assert.deepEqual(report.windows.map(({ id, label, remainingPct }) => ({ id, label, remainingPct })), [
+    { id: "gemini", label: "Gemini · 5h cap", remainingPct: 88 },
+    { id: "3p", label: "Claude & GPT · Weekly cap", remainingPct: 67 },
+  ]);
 });
 
 test("keyring and upstream failures show errors without exposing private payloads", async () => {
@@ -227,11 +439,11 @@ test("switching the CLI login updates both the discovered account and fetched qu
   assert.ok(original);
   const before = await api.fetch(original.input);
   assert.ok(before.status === "available");
-  assert.equal(before.windows.find(({ id }) => id === "gemini-weekly")?.remainingPct, 25);
+  assert.equal(before.windows.find(({ id }) => id === "gemini")?.remainingPct, 88);
   stored = login("next@example.com", "next-access");
   const [current] = await api.discover({ kind: "global" });
   assert.equal(current?.label, "next@example.com");
   const report = await api.fetch(original.input);
   assert.ok(report.status === "available");
-  assert.equal(report.windows.find(({ id }) => id === "gemini-weekly")?.remainingPct, 80);
+  assert.equal(report.windows.find(({ id }) => id === "gemini")?.remainingPct, 80);
 });

@@ -4,30 +4,192 @@ import {
   windowFromUsedPct,
   type UsageDetail,
   type UsageReport,
+  type UsageWindow,
 } from "@getpaseo/plugin/server/usage";
 import { z } from "zod";
 import { timestampMs } from "./probe.js";
 import { UsageError } from "./errors.js";
 
-// These period names are justified by the API's bucketId, not response order or
-// time until reset. durationMs is not part of Paseo 0.11's UsageWindow contract.
-const BUCKETS: readonly { id: string; label: string; shortLabel: string; optional?: true }[] = [
-  { id: "gemini-5h", label: "Gemini · 5h", shortLabel: "Gemini 5h" },
-  { id: "gemini-weekly", label: "Gemini · Weekly", shortLabel: "Gemini wk" },
-  { id: "3p-5h", label: "Claude & GPT · 5h", shortLabel: "3P 5h" },
-  { id: "3p-weekly", label: "Claude & GPT · Weekly", shortLabel: "3P wk" },
-  // Paid plans meter Gemini 4 Argon in a pool of its own. Other logins do not report it.
-  { id: "gemini-argon-wtu-weekly", label: "Gemini 4 Argon · Weekly", shortLabel: "Argon wk", optional: true },
-];
-
 const summarySchema = z.object({ groups: z.array(z.unknown()) });
-const groupSchema = z.object({ buckets: z.array(z.unknown()) });
+const groupSchema = z.object({
+  displayName: z.string().optional(),
+  description: z.string().optional(),
+  buckets: z.array(z.unknown()),
+});
 const bucketSchema = z.object({
   bucketId: z.string(),
+  displayName: z.string().optional(),
+  window: z.string().optional(),
+  disabled: z.boolean().optional(),
   remainingFraction: z.unknown().optional(),
   resetTime: z.unknown().optional(),
 });
+
+const modelEntrySchema = z.object({
+  displayName: z.string().optional(),
+  apiProvider: z.string().optional(),
+  modelProvider: z.string().optional(),
+  disabled: z.boolean().optional(),
+  isInternal: z.boolean().optional(),
+  recommended: z.boolean().optional(),
+  tagTitle: z.string().optional(),
+  tagDescription: z.string().optional(),
+});
+
+const availableModelsSchema = z.object({
+  models: z.record(z.string(), z.unknown()),
+  agentModelSorts: z.array(z.object({
+    groups: z.array(z.object({
+      modelIds: z.array(z.string()),
+    })).optional(),
+  })).optional(),
+});
+
 type Bucket = z.infer<typeof bucketSchema>;
+type ModelEntry = z.infer<typeof modelEntrySchema>;
+type WindowPeriod = "5h" | "weekly" | "other";
+
+export interface DisabledModelNote {
+  id: string;
+  name: string;
+  reason: string;
+}
+
+export interface ModelCatalog {
+  gemini: string[];
+  threeParty: string[];
+  argon: string[];
+  carbon: string[];
+  disabled: DisabledModelNote[];
+}
+
+interface ParsedBucket {
+  bucket: Bucket;
+  period: WindowPeriod;
+  usedPct: number | null;
+  resetsAtMs: number | null;
+}
+
+interface PoolAccumulator {
+  poolId: string;
+  order: number;
+  groupName: string | null;
+  active: ParsedBucket[];
+  disabled: ParsedBucket[];
+}
+
+const POOL_PRIORITY: Record<string, number> = {
+  gemini: 0,
+  "3p": 1,
+  argon: 2,
+  carbon: 3,
+};
+
+const PERIOD_PRIORITY: Record<WindowPeriod, number> = {
+  "5h": 0,
+  weekly: 1,
+  other: 2,
+};
+
+function shortFamilyName(displayName: string): string {
+  const withoutEffort = displayName.replace(/\s*\((?:Low|Medium|High|XHigh|Max)\)\s*$/i, "").trim();
+  if (/^Gemini\s+4\s+/i.test(withoutEffort)) {
+    return withoutEffort.replace(/^Gemini\s+4\s+/i, "").trim();
+  }
+  if (/^Gemini\s+\d/i.test(withoutEffort)) {
+    return withoutEffort.replace(/^Gemini\s+/i, "").trim();
+  }
+  if (/^Claude\s+/i.test(withoutEffort)) {
+    return withoutEffort.replace(/^Claude\s+/i, "").trim();
+  }
+  if (/^GPT-OSS\b/i.test(withoutEffort)) {
+    return "GPT-OSS";
+  }
+  return withoutEffort;
+}
+
+function isThreePartyModel(id: string, entry: ModelEntry): boolean {
+  const api = entry.apiProvider ?? "";
+  const provider = entry.modelProvider ?? "";
+  return (
+    api === "API_PROVIDER_ANTHROPIC_VERTEX" ||
+    api === "API_PROVIDER_OPENAI_VERTEX" ||
+    provider === "MODEL_PROVIDER_ANTHROPIC" ||
+    provider === "MODEL_PROVIDER_OPENAI" ||
+    id.startsWith("claude-") ||
+    id.startsWith("gpt-")
+  );
+}
+
+function isGoogleModel(id: string, entry: ModelEntry): boolean {
+  return (
+    entry.apiProvider === "API_PROVIDER_GOOGLE_GEMINI" ||
+    entry.modelProvider === "MODEL_PROVIDER_GOOGLE" ||
+    id.startsWith("gemini-")
+  );
+}
+
+function addUnique(list: string[], value: string): void {
+  if (value && !list.includes(value)) list.push(value);
+}
+
+export function extractModelCatalog(document: unknown): ModelCatalog | null {
+  const parsed = availableModelsSchema.safeParse(document);
+  if (!parsed.success) return null;
+
+  const entries = new Map<string, ModelEntry>();
+  for (const [id, raw] of Object.entries(parsed.data.models)) {
+    const model = modelEntrySchema.safeParse(raw);
+    if (model.success) entries.set(id, model.data);
+  }
+
+  // agentModelSorts lists the active picker models without legacy/deprecated clutter.
+  const sortedIds = (parsed.data.agentModelSorts ?? [])
+    .flatMap((sort) => sort.groups ?? [])
+    .flatMap((group) => group.modelIds)
+    .filter((id) => entries.has(id));
+
+  const primaryIds = sortedIds.length > 0 ? sortedIds : [...entries.keys()];
+  const catalog: ModelCatalog = { gemini: [], threeParty: [], argon: [], carbon: [], disabled: [] };
+  const seenDisabled = new Set<string>();
+
+  const recordDisabled = (id: string, entry: ModelEntry) => {
+    if (entry.isInternal || !entry.displayName) return;
+    const name = shortFamilyName(entry.displayName);
+    if (!name || seenDisabled.has(name)) return;
+    seenDisabled.add(name);
+    const reason = entry.tagDescription?.trim() || entry.tagTitle?.trim() || "Unavailable";
+    catalog.disabled.push({ id, name, reason });
+  };
+
+  for (const id of primaryIds) {
+    const entry = entries.get(id);
+    if (!entry || entry.isInternal || !entry.displayName) continue;
+    if (entry.disabled) {
+      recordDisabled(id, entry);
+      continue;
+    }
+    const name = shortFamilyName(entry.displayName);
+    if (isThreePartyModel(id, entry)) {
+      addUnique(catalog.threeParty, name);
+    } else if (isGoogleModel(id, entry)) {
+      if (/\bargon\b/i.test(id) || /\bargon\b/i.test(name)) {
+        addUnique(catalog.argon, name);
+      } else if (/\bcarbon\b/i.test(id) || /\bcarbon\b/i.test(name)) {
+        addUnique(catalog.carbon, name);
+      } else {
+        addUnique(catalog.gemini, name);
+      }
+    }
+  }
+
+  // Catch disabled models (e.g., Carbon) even if absent from agentModelSorts.
+  for (const [id, entry] of entries) {
+    if (entry.disabled) recordDisabled(id, entry);
+  }
+
+  return catalog;
+}
 
 export function readTierLabel(document: unknown): string | null {
   const tier = z.object({ id: z.string().min(1) });
@@ -52,55 +214,266 @@ export function readTierLabel(document: unknown): string | null {
   return Object.hasOwn(names, id) ? names[id] ?? id : id;
 }
 
+function classifyPool(bucketId: string, groupName: string | null, groupIndex: number): string {
+  if (bucketId === "gemini-5h" || bucketId === "gemini-weekly") return "gemini";
+  if (bucketId === "3p-5h" || bucketId === "3p-weekly") return "3p";
+  if (/argon/i.test(bucketId) || (groupName !== null && /argon/i.test(groupName))) return "argon";
+  if (/carbon/i.test(bucketId) || (groupName !== null && /carbon/i.test(groupName))) return "carbon";
+  return `custom:${groupName ? groupName.toLowerCase() : String(groupIndex)}`;
+}
+
+function inferPeriod(bucket: Bucket): WindowPeriod {
+  const raw = bucket.window?.trim().toLowerCase();
+  if (raw === "5h") return "5h";
+  if (raw === "weekly") return "weekly";
+  if (/(?:^|[-_])5h(?:$|[-_])/i.test(bucket.bucketId)) return "5h";
+  if (/weekly/i.test(bucket.bucketId)) return "weekly";
+  return "other";
+}
+
+function periodLabel(period: WindowPeriod, fallbackDisplayName?: string): string {
+  if (period === "5h") return "5h";
+  if (period === "weekly") return "Weekly";
+  return fallbackDisplayName?.trim() || "Limit";
+}
+
+function shortPeriodSuffix(period: WindowPeriod): string {
+  if (period === "5h") return "5h";
+  if (period === "weekly") return "wk";
+  return "";
+}
+
+function selectBottleneck(valid: ParsedBucket[]): { chosen: ParsedBucket; resetsAtMs: number | null } {
+  const first = valid[0]!;
+  if (valid.length === 1) {
+    return { chosen: first, resetsAtMs: first.resetsAtMs };
+  }
+
+  const maxUsed = Math.max(...valid.map((entry) => entry.usedPct ?? -1));
+  const tied = valid.filter((entry) => entry.usedPct === maxUsed);
+  const allExhausted = maxUsed >= 100 && valid.every((entry) => (entry.usedPct ?? 0) >= 100);
+
+  if (allExhausted) {
+    // When every window in the pool is exhausted, service resumes only after the latest reset.
+    const sortedByLatestReset = [...tied].sort((a, b) => (b.resetsAtMs ?? -1) - (a.resetsAtMs ?? -1));
+    const chosen = sortedByLatestReset[0]!;
+    return { chosen, resetsAtMs: chosen.resetsAtMs };
+  }
+
+  const sorted = [...tied].sort((a, b) => PERIOD_PRIORITY[a.period] - PERIOD_PRIORITY[b.period]);
+  const chosen = sorted[0]!;
+  return { chosen, resetsAtMs: chosen.resetsAtMs };
+}
+
+function poolNaming(
+  pool: PoolAccumulator,
+  hasSeparateArgon: boolean,
+  hasSeparateCarbon: boolean,
+  catalog: ModelCatalog | null,
+): { windowId: string; baseName: string; shortBase: string } {
+  if (pool.poolId === "gemini") {
+    const families: string[] = [];
+    if (catalog) {
+      for (const name of catalog.gemini) addUnique(families, name);
+      if (!hasSeparateArgon) {
+        for (const name of catalog.argon) addUnique(families, name);
+      }
+      if (!hasSeparateCarbon) {
+        for (const name of catalog.carbon) addUnique(families, name);
+      }
+    }
+    const baseName = families.length > 0 ? families.join(" · ") : "Gemini";
+    const shortBase = families[0] ?? "Gemini";
+    return { windowId: "gemini", baseName, shortBase };
+  }
+
+  if (pool.poolId === "3p") {
+    const families = catalog?.threeParty ?? [];
+    const baseName = families.length > 0 ? families.join(" · ") : "Claude & GPT";
+    const shortBase = families[0] ?? "3P";
+    return { windowId: "3p", baseName, shortBase };
+  }
+
+  if (pool.poolId === "argon") {
+    const existingId = pool.active.find((entry) => entry.bucket.bucketId === "gemini-argon-wtu-weekly")
+      ?.bucket.bucketId;
+    const families = catalog?.argon ?? [];
+    const baseName = families.length > 0 ? families.join(" · ") : "Argon";
+    return { windowId: existingId ?? "argon", baseName, shortBase: "Argon" };
+  }
+
+  if (pool.poolId === "carbon") {
+    const firstId = pool.active[0]?.bucket.bucketId ?? pool.disabled[0]?.bucket.bucketId ?? "carbon";
+    const families = catalog?.carbon ?? [];
+    const baseName = families.length > 0 ? families.join(" · ") : "Carbon";
+    return { windowId: firstId, baseName, shortBase: "Carbon" };
+  }
+
+  const first = pool.active[0] ?? pool.disabled[0];
+  const baseName = pool.groupName || first?.bucket.displayName?.trim() || first?.bucket.bucketId || "Quota";
+  const windowId = pool.active.length === 1 && first ? first.bucket.bucketId : pool.poolId;
+  return { windowId, baseName, shortBase: baseName.slice(0, 14) };
+}
+
 export function mapQuotaSummary(
   document: unknown,
   planLabel: string | null = null,
+  modelCatalog: ModelCatalog | null = null,
 ): UsageReport {
   const parsed = summarySchema.safeParse(document);
   if (!parsed.success) throw new UsageError("Antigravity returned an invalid quota summary (expected groups).");
-  const byId = new Map<string, Bucket>();
-  for (const rawGroup of parsed.data.groups) {
+
+  const pools = new Map<string, PoolAccumulator>();
+  const seenBucketIds = new Set<string>();
+
+  for (const [groupIndex, rawGroup] of parsed.data.groups.entries()) {
     const group = groupSchema.safeParse(rawGroup);
     if (!group.success) throw new UsageError("Antigravity returned an invalid quota group (expected buckets).");
+    const groupName = group.data.displayName?.trim() || null;
+
     for (const rawBucket of group.data.buckets) {
-      const bucket = bucketSchema.safeParse(rawBucket);
-      if (bucket.success && !byId.has(bucket.data.bucketId)) byId.set(bucket.data.bucketId, bucket.data);
+      const parsedBucket = bucketSchema.safeParse(rawBucket);
+      if (!parsedBucket.success) continue;
+      const bucket = parsedBucket.data;
+      if (seenBucketIds.has(bucket.bucketId)) continue;
+      seenBucketIds.add(bucket.bucketId);
+
+      const poolId = classifyPool(bucket.bucketId, groupName, groupIndex);
+      let pool = pools.get(poolId);
+      if (!pool) {
+        pool = {
+          poolId,
+          order: POOL_PRIORITY[poolId] ?? (100 + groupIndex),
+          groupName,
+          active: [],
+          disabled: [],
+        };
+        pools.set(poolId, pool);
+      } else if (!pool.groupName && groupName) {
+        pool.groupName = groupName;
+      }
+
+      const remaining = bucket.remainingFraction;
+      const usedPct = typeof remaining === "number" && Number.isFinite(remaining)
+        ? Math.max(0, Math.min(100, (1 - remaining) * 100))
+        : null;
+      const entry: ParsedBucket = {
+        bucket,
+        period: inferPeriod(bucket),
+        usedPct,
+        resetsAtMs: timestampMs(bucket.resetTime),
+      };
+
+      if (bucket.disabled) {
+        pool.disabled.push(entry);
+      } else {
+        pool.active.push(entry);
+      }
     }
   }
-  if (!BUCKETS.some(({ id }) => byId.has(id))) {
-    return unavailable({ kind: "no_quota", detail: "Antigravity did not report the Gemini or Claude & GPT quota pools for this login." });
+
+  if (pools.size === 0) {
+    return unavailable({ kind: "no_quota", detail: "Antigravity did not report any quota pools for this login." });
   }
 
-  const windows = BUCKETS.filter(({ id, optional }) => !optional || byId.has(id)).map(({ id, label, shortLabel }) => {
-    const bucket = byId.get(id);
-    const remaining = bucket?.remainingFraction;
-    const usedPct = typeof remaining === "number" && Number.isFinite(remaining)
-      ? Math.max(0, Math.min(100, (1 - remaining) * 100)) : null;
-    const resetsAtMs = timestampMs(bucket?.resetTime);
-    return windowFromUsedPct({
-      id,
+  const orderedPools = [...pools.values()].sort((a, b) => a.order - b.order);
+  const hasSeparateArgon = pools.has("argon");
+  const hasSeparateCarbon = pools.has("carbon");
+
+  const windows: UsageWindow[] = [];
+  const details: UsageDetail[] = [];
+
+  for (const pool of orderedPools) {
+    const { windowId, baseName, shortBase } = poolNaming(pool, hasSeparateArgon, hasSeparateCarbon, modelCatalog);
+
+    if (pool.active.length === 0) {
+      details.push({ id: `disabled-${pool.poolId}`, label: baseName, value: "Disabled" });
+      continue;
+    }
+
+    const valid = pool.active.filter((entry) => entry.usedPct !== null);
+    if (valid.length === 0) {
+      const onlyPeriod = pool.active.length === 1 ? periodLabel(pool.active[0]!.period) : null;
+      windows.push(windowFromUsedPct({
+        id: windowId,
+        label: onlyPeriod ? `${baseName} · ${onlyPeriod}` : baseName,
+        shortLabel: shortBase,
+        summary: true,
+        utilizationPct: null,
+        resetsAt: null,
+        tone: toneFromUsedPct(null),
+      }));
+      continue;
+    }
+
+    const { chosen, resetsAtMs } = selectBottleneck(valid);
+    const hasMultipleWindows = valid.length > 1;
+    const pLabel = periodLabel(chosen.period, chosen.bucket.displayName);
+    const label = hasMultipleWindows
+      ? `${baseName} · ${pLabel} cap`
+      : `${baseName} · ${pLabel}`;
+    const shortSuffix = shortPeriodSuffix(chosen.period);
+    const shortLabel = shortSuffix ? `${shortBase} ${shortSuffix}` : shortBase;
+
+    windows.push(windowFromUsedPct({
+      id: windowId,
       label,
       shortLabel,
       summary: true,
-      utilizationPct: usedPct,
+      utilizationPct: chosen.usedPct,
       resetsAt: resetsAtMs === null ? null : new Date(resetsAtMs).toISOString(),
-      tone: toneFromUsedPct(usedPct),
-    });
-  });
-  if (windows.every((window) => window.usedPct === null)) {
+      tone: toneFromUsedPct(chosen.usedPct),
+    }));
+
+    if (hasMultipleWindows) {
+      const sortedWindows = [...valid].sort((a, b) => PERIOD_PRIORITY[a.period] - PERIOD_PRIORITY[b.period]);
+      const summaryLine = sortedWindows
+        .map((entry) => `${periodLabel(entry.period, entry.bucket.displayName)} ${Math.round(entry.usedPct!)}% used`)
+        .join(" · ");
+      details.push({
+        id: `breakdown-${pool.poolId}`,
+        label: baseName,
+        value: summaryLine,
+      });
+    }
+  }
+
+  if (windows.length > 0 && windows.every((window) => window.usedPct === null)) {
     throw new UsageError("Antigravity quota buckets contain no valid remainingFraction readings.");
   }
-  const details: UsageDetail[] = [];
+
+  if (modelCatalog) {
+    for (const disabled of modelCatalog.disabled) {
+      // Avoid duplicating if the quota summary already emitted a disabled detail for this pool.
+      const coveredByPool =
+        (disabled.id.includes("carbon") && pools.get("carbon")?.active.length === 0) ||
+        (disabled.id.includes("argon") && pools.get("argon")?.active.length === 0);
+      if (!coveredByPool) {
+        details.push({
+          id: `disabled-model-${disabled.id}`,
+          label: disabled.name,
+          value: disabled.reason,
+        });
+      }
+    }
+  }
+
   if (planLabel === "Free tier") {
     details.push({
       id: "free-tier-note",
       label: "Free tier",
-      value: "On free plans the 5h buckets may stay at full remaining quota; use the weekly buckets to track consumption.",
+      value: "On free plans the 5h buckets may stay at full remaining quota; use the weekly value to track consumption.",
     });
   }
+
   if (windows.some((window) => window.usedPct === null)) {
-    details.push({ id: "missing-buckets", label: "Quota data", value: "Some quota buckets were omitted or had no valid reading; their usage is unknown, not zero." });
+    details.push({
+      id: "missing-buckets",
+      label: "Quota data",
+      value: "Some quota buckets were omitted or had no valid reading; their usage is unknown, not zero.",
+    });
   }
+
   return {
     status: "available",
     ...(planLabel ? { planLabel } : {}),

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createNodeProbe } from "./probe.js";
+import { createNodeProbe, parseStoredCredential } from "./probe.js";
 
 test("优先级 1: ANTIGRAVITY_CLI_PATH 命中指定文件", async () => {
   const target = "/custom/tools/agy";
@@ -148,4 +148,14 @@ test("优先级 3 Linux: 不探测 macOS 特有的 /opt/homebrew/bin", async () 
     isExecutable: async (p) => p === "/opt/homebrew/bin/agy",
   });
   assert.equal(await probe.locateBinary(), null);
+});
+
+test("parseStoredCredential reads top-level id_token_email written by agy keychain", () => {
+  const parsed = parseStoredCredential(JSON.stringify({
+    token: { access_token: "tok", expiry: "2030-01-01T00:00:00Z" },
+    auth_method: "consumer",
+    id_token_email: "user@example.com",
+  }));
+  assert.equal(parsed.email, "user@example.com");
+  assert.equal(parsed.accessToken, "tok");
 });

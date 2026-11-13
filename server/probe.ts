@@ -79,11 +79,18 @@ const tokenSchema = z.object({
   expiresAt: z.union([z.string(), z.number()]).optional(),
   expiry_date: z.union([z.string(), z.number()]).optional(),
   email: z.string().optional(),
+  id_token_email: z.string().optional(),
+  idTokenEmail: z.string().optional(),
   id_token: z.unknown().optional(),
   idToken: z.unknown().optional(),
 });
 
 const storedSchema = tokenSchema.extend({ token: tokenSchema.optional() });
+
+function nonEmpty(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
 
 /** Accept RFC3339, Unix seconds and Unix milliseconds, but never invent an expiry. */
 export function timestampMs(value: unknown): number | null {
@@ -134,7 +141,14 @@ export function parseStoredCredential(raw: string): StoredCredential {
   return {
     accessToken,
     expiresAtMs: timestampMs(token.expiry ?? token.expires_at ?? token.expiresAt ?? token.expiry_date),
-    email: root.email || token.email || emailFromIdToken(root.id_token ?? root.idToken ?? token.id_token ?? token.idToken),
+    email:
+      nonEmpty(root.email) ??
+      nonEmpty(token.email) ??
+      nonEmpty(root.id_token_email) ??
+      nonEmpty(root.idTokenEmail) ??
+      nonEmpty(token.id_token_email) ??
+      nonEmpty(token.idTokenEmail) ??
+      emailFromIdToken(root.id_token ?? root.idToken ?? token.id_token ?? token.idToken),
   };
 }
 

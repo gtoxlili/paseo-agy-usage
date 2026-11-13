@@ -7,7 +7,7 @@ import {
 } from "@getpaseo/plugin/server/usage";
 import { inputSchema } from "../shared/input.js";
 import { createNodeProbe, ProbeError, type AntigravityProbe, type StoredCredential } from "./probe.js";
-import { mapQuotaSummary, readTierLabel } from "./quota.js";
+import { extractModelCatalog, mapQuotaSummary, readTierLabel } from "./quota.js";
 import { UsageError } from "./errors.js";
 
 const BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:";
@@ -42,7 +42,7 @@ export async function withTimeout<T>(
 }
 
 async function request(
-  method: "retrieveUserQuotaSummary" | "loadCodeAssist",
+  method: "retrieveUserQuotaSummary" | "loadCodeAssist" | "fetchAvailableModels",
   token: string,
   userAgent: string,
   fetchApi: typeof fetch,
@@ -124,14 +124,17 @@ export function createUsageHandlers(dependencies: UsageDependencies) {
             }
             const token = login.accessToken;
             if (!token) return unavailable({ kind: "rejected", status: 401, refreshedBy: "agy" });
-            // 套餐查询失败不掩盖有效额度，也不触发无关的登录续期。
-            const [document, planLabel] = await Promise.all([
+            // 套餐与模型列表查询失败不掩盖有效额度，也不触发无关的登录续期。
+            const [document, planLabel, modelCatalog] = await Promise.all([
               request("retrieveUserQuotaSummary", token, userAgent, fetchApi, signal),
               withTimeout(2_500, "plan lookup", async (planSignal) => readTierLabel(
                 await request("loadCodeAssist", token, userAgent, fetchApi, AbortSignal.any([signal, planSignal])),
               )).catch(() => null),
+              withTimeout(2_500, "model lookup", async (modelSignal) => extractModelCatalog(
+                await request("fetchAvailableModels", token, userAgent, fetchApi, AbortSignal.any([signal, modelSignal])),
+              )).catch(() => null),
             ]);
-            return mapQuotaSummary(document, planLabel);
+            return mapQuotaSummary(document, planLabel, modelCatalog);
           };
           let report: UsageReport;
           try {
